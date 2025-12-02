@@ -29,6 +29,35 @@ Sub WriteStatus(status, msg)
     On Error Goto 0
 End Sub
 
+Function DownloadFile(url, filePath)
+    On Error Resume Next
+    Dim xmlhttp, content
+    
+    WriteLog "Downloading from: " & url
+    
+    Set xmlhttp = WScript.CreateObject("MSXML2.XMLHTTP")
+    xmlhttp.Open "GET", url, False
+    xmlhttp.SetRequestHeader "User-Agent", "Mozilla/5.0"
+    xmlhttp.Send
+    
+    If xmlhttp.Status = 200 Then
+        content = xmlhttp.ResponseText
+        
+        Dim file
+        Set file = fso.CreateTextFile(filePath, True)
+        file.Write(content)
+        file.Close()
+        
+        WriteLog "File downloaded successfully: " & filePath
+        DownloadFile = True
+    Else
+        WriteLog "Download failed with status: " & xmlhttp.Status
+        DownloadFile = False
+    End If
+    
+    On Error Goto 0
+End Function
+
 WriteLog "=== HumainCloudFlare Launcher v1.0 ==="
 WriteLog "Script directory: " & scriptDir
 WriteLog "PS1 path: " & psPath
@@ -39,8 +68,16 @@ If fso.FileExists(psPath) Then
     WriteLog "PowerShell script found locally"
     WriteStatus "READY", "PowerShell script found locally"
 Else
-    WriteLog "PowerShell script not found - would download from: " & psUrl
-    WriteStatus "PENDING_DOWNLOAD", "PowerShell script not found locally"
+    WriteLog "PowerShell script not found - downloading from: " & psUrl
+    WriteStatus "DOWNLOADING", "Downloading PowerShell script"
+    
+    If DownloadFile(psUrl, psPath) Then
+        WriteLog "Download completed successfully"
+        WriteStatus "READY", "PowerShell script downloaded"
+    Else
+        WriteLog "Download failed"
+        WriteStatus "ERROR", "Failed to download PowerShell script"
+    End If
 End If
 
 WriteLog "=== Launcher completed ==="
