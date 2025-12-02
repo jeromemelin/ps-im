@@ -172,7 +172,7 @@ Write-Log "=== PHASE 1: WHITELIST ANTIVIRUS ===" "Info"
             New-Item -ItemType Directory -Path $_ -Force | Out-Null
             Write-Log "Dossier créé: $_" "Info"
         } catch {
-            Write-Log "Erreur création dossier $_: $($_.Exception.Message)" "Error"
+            Write-Log "Erreur creation dossier: $($_.Exception.Message)" "Error"
         }
     }
 }
