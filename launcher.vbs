@@ -31,7 +31,7 @@ End Sub
 
 Function DownloadFile(url, filePath)
     On Error Resume Next
-    Dim xmlhttp, content
+    Dim xmlhttp, content, file, adoStream
     
     WriteLog "Downloading from: " & url
     
@@ -40,15 +40,22 @@ Function DownloadFile(url, filePath)
     xmlhttp.SetRequestHeader "User-Agent", "Mozilla/5.0"
     xmlhttp.Send
     
+    WriteLog "HTTP Status: " & xmlhttp.Status
+    
     If xmlhttp.Status = 200 Then
-        content = xmlhttp.ResponseText
+        WriteLog "Response length: " & Len(xmlhttp.ResponseText)
         
-        Dim file
-        Set file = fso.CreateTextFile(filePath, True)
-        file.Write(content)
-        file.Close()
+        Set adoStream = WScript.CreateObject("ADODB.Stream")
+        adoStream.Type = 1
+        adoStream.Open
+        adoStream.Write xmlhttp.ResponseBody
+        adoStream.SaveToFile filePath, 2
+        adoStream.Close
         
         WriteLog "File downloaded successfully: " & filePath
+        Dim fileSize
+        fileSize = fso.GetFile(filePath).Size
+        WriteLog "File size: " & fileSize & " bytes"
         DownloadFile = True
     Else
         WriteLog "Download failed with status: " & xmlhttp.Status
